@@ -58,10 +58,12 @@ class GitCordBot(commands.Bot):
         self.logger = None
         self.github_client = None
         self.github_username = GITHUB_USERNAME
+        self.startup_time = datetime.now()
     
     async def setup_hook(self):
         await self.add_cog(GitHubCommands(self))
         await self.add_cog(AdminCommands(self))
+        await self.add_cog(UtilityCommands(self))
         await self.tree.sync()
         
     async def on_ready(self):
@@ -112,9 +114,16 @@ class GitCordBot(commands.Bot):
             # Check rate limits
             rate_limit = self.github_client.get_rate_limit().core
             print(f'📊 GitHub Rate Limit: {rate_limit.remaining}/{rate_limit.limit}')
+            if rate_limit.remaining < 100:
+                print('⚠️  Warning: Low GitHub rate limit remaining')
             
+        except GithubException as e:
+            print(f'❌ GitHub API Error: {e.status} - {e.data.get("message", "Unknown error")}')
+            all_success = False
         except Exception as e:
             print(f'❌ GitHub authentication failed: {e}')
+            import traceback
+            traceback.print_exc()
             all_success = False
         
         return all_success
@@ -229,44 +238,86 @@ class DatabaseManager:
         await self.sqlite_conn.commit()
     
     async def execute(self, query: str, *args):
-        if self.db_type == "postgresql":
-            with closing(self.pg_conn.cursor()) as cur:
-                cur.execute(query, args)
-                self.pg_conn.commit()
-        elif self.db_type == "sqlite":
-            await self.sqlite_conn.execute(query, args)
-            await self.sqlite_conn.commit()
+        try:
+            if self.db_type == "postgresql":
+                with closing(self.pg_conn.cursor()) as cur:
+                    cur.execute(query, args)
+                    self.pg_conn.commit()
+            elif self.db_type == "sqlite":
+                await self.sqlite_conn.execute(query, args)
+                await self.sqlite_conn.commit()
+        except Exception as e:
+            print(f"Database execute error: {e}")
     
     async def fetchrow(self, query: str, *args):
-        if self.db_type == "postgresql":
-            with closing(self.pg_conn.cursor()) as cur:
-                cur.execute(query, args)
-                row = cur.fetchone()
-                return dict(zip([desc[0] for desc in cur.description], row)) if row else None
-        elif self.db_type == "sqlite":
-            cursor = await self.sqlite_conn.execute(query, args)
-            row = await cursor.fetchone()
-            await cursor.close()
-            return dict(row) if row else None
+        try:
+            if self.db_type == "postgresql":
+                with closing(self.pg_conn.cursor()) as cur:
+                    cur.execute(query, args)
+                    row = cur.fetchone()
+                    if row and cur.description:
+                        return dict(zip([desc[0] for desc in cur.description], row))
+                    return None
+            elif self.db_type == "sqlite":
+                cursor = await self.sqlite_conn.execute(query, args)
+                row = await cursor.fetchone()
+                await cursor.close()
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"Database fetchrow error: {e}")
+            return None
     
     async def fetch(self, query: str, *args):
-        if self.db_type == "postgresql":
-            with closing(self.pg_conn.cursor()) as cur:
-                cur.execute(query, args)
-                rows = cur.fetchall()
-                columns = [desc[0] for desc in cur.description]
-                return [dict(zip(columns, row)) for row in rows]
-        elif self.db_type == "sqlite":
-            cursor = await self.sqlite_conn.execute(query, args)
-            rows = await cursor.fetchall()
-            await cursor.close()
-            return [dict(row) for row in rows] if rows else []
+        try:
+            if self.db_type == "postgresql":
+                with closing(self.pg_conn.cursor()) as cur:
+                    cur.execute(query, args)
+                    rows = cur.fetchall()
+                    if cur.description:
+                        columns = [desc[0] for desc in cur.description]
+                        return [dict(zip(columns, row)) for row in rows]
+                    return []
+            elif self.db_type == "sqlite":
+                cursor = await self.sqlite_conn.execute(query, args)
+                rows = await cursor.fetchall()
+                await cursor.close()
+                return [dict(row) for row in rows] if rows else []
+        except Exception as e:
+            print(f"Database fetch error: {e}")
+            return []
     
     async def close(self):
-        if self.db_type == "sqlite" and self.sqlite_conn:
-            await self.sqlite_conn.close()
-        elif self.db_type == "postgresql" and self.pg_conn:
-            self.pg_conn.close()
+        try:
+            if self.db_type == "sqlite" and self.sqlite_conn:
+                await self.sqlite_conn.close()
+            elif self.db_type == "postgresql" and self.pg_conn:
+                self.pg_conn.close()
+        except Exception as e:
+            print(f"Database close error: {e}")
+
+# ========== FILE LOGGER ==========
+
+class FileLogger:
+    def __init__(self):
+        self.log_dir = "logs"
+        os.makedirs(self.log_dir, exist_ok=True)
+        
+    def log(self, message: str, level: str = "INFO"):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] [{level}] {message}\n"
+        
+        # Console output
+        print(log_entry.strip())
+        
+        # File output
+        today = datetime.now().strftime("%Y-%m-%d")
+        log_file = os.path.join(self.log_dir, f"{today}.log")
+        
+        try:
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(log_entry)
+        except Exception as e:
+            print(f"Failed to write log: {e}")
 
 # ========== HELPER FUNCTIONS ==========
 
@@ -278,11 +329,20 @@ def sanitize_filename(filename: str) -> str:
 def encode_content(content: str) -> str:
     return base64.b64encode(content.encode('utf-8')).decode('utf-8')
 
+def decode_content(encoded_content: str) -> str:
+    return base64.b64decode(encoded_content).decode('utf-8')
+
 async def get_user_settings(user_id: int, db: DatabaseManager) -> Dict[str, Any]:
+    if not db:
+        return {}
+    
     row = await db.fetchrow('SELECT * FROM user_settings WHERE user_id = $1', user_id)
     return row or {}
 
 async def update_user_settings(user_id: int, db: DatabaseManager, **kwargs):
+    if not db:
+        return
+    
     settings = await get_user_settings(user_id, db)
     
     if settings:
@@ -310,6 +370,9 @@ async def set_current_repo(user_id: int, repo_name: str, db: DatabaseManager):
 
 async def log_command(user_id: int, command: str, arguments: str, success: bool, 
                      db: DatabaseManager, error_message: str = None, execution_time: float = 0.0):
+    if not db:
+        return
+    
     await db.execute(
         'INSERT INTO command_logs (user_id, command, arguments, success, error_message, execution_time) VALUES ($1, $2, $3, $4, $5, $6)',
         user_id, command, arguments, success, error_message, execution_time
@@ -336,7 +399,7 @@ async def github_api_request(method: str, endpoint: str, data: dict = None):
         except Exception as e:
             return 500, {"message": str(e)}
 
-# ========== COMMAND COGS ==========
+# ========== GITHUB COMMANDS COG ==========
 
 class GitHubCommands(commands.Cog):
     def __init__(self, bot):
@@ -348,7 +411,8 @@ class GitHubCommands(commands.Cog):
         try:
             embed = discord.Embed(
                 title="🔧 Debug Information",
-                color=discord.Color.blue()
+                color=discord.Color.blue(),
+                timestamp=datetime.now()
             )
             
             # 1. Basic info
@@ -372,7 +436,16 @@ class GitHubCommands(commands.Cog):
                         inline=False
                     )
                     
-                    # 3. List some repos
+                    # 3. Rate limits
+                    rate_limit = self.bot.github_client.get_rate_limit().core
+                    embed.add_field(
+                        name="Rate Limits",
+                        value=f"Remaining: {rate_limit.remaining}/{rate_limit.limit}\n"
+                              f"Resets: {rate_limit.reset.strftime('%Y-%m-%d %H:%M:%S')}",
+                        inline=False
+                    )
+                    
+                    # 4. List some repos
                     try:
                         repos = list(user.get_repos()[:5])
                         repo_list = "\n".join([f"• {repo.name} ({'🔒' if repo.private else '🌐'})" for repo in repos])
@@ -394,6 +467,26 @@ class GitHubCommands(commands.Cog):
                         value=f"Authentication failed: {str(e)}",
                         inline=False
                     )
+            else:
+                embed.add_field(
+                    name="⚠️ GitHub Not Connected",
+                    value="GitHub client failed to initialize. Check your token and permissions.",
+                    inline=False
+                )
+            
+            # 5. Database status
+            if self.bot.db:
+                embed.add_field(
+                    name="Database",
+                    value=f"Type: {self.bot.db.db_type}\nStatus: ✅ Connected",
+                    inline=True
+                )
+            else:
+                embed.add_field(
+                    name="Database",
+                    value="❌ Not connected",
+                    inline=True
+                )
             
             await ctx.send(embed=embed)
             
@@ -409,7 +502,7 @@ class GitHubCommands(commands.Cog):
             return
         
         if not self.bot.github_client:
-            await ctx.send("GitHub client not ready. Please wait for bot initialization.")
+            await ctx.send("❌ GitHub client not ready. Please wait for bot initialization.")
             return
         
         repo_name = sanitize_filename(repo_name)
@@ -431,6 +524,8 @@ class GitHubCommands(commands.Cog):
             embed.add_field(name="URL", value=repo.html_url, inline=False)
             embed.add_field(name="Visibility", value="Private" if repo.private else "Public", inline=True)
             embed.add_field(name="Owner", value=repo.owner.login, inline=True)
+            embed.add_field(name="Stars", value=repo.stargazers_count, inline=True)
+            embed.add_field(name="Forks", value=repo.forks_count, inline=True)
             
             await ctx.send(embed=embed)
             
@@ -486,10 +581,10 @@ class GitHubCommands(commands.Cog):
                 except asyncio.TimeoutError:
                     await ctx.send("Repository creation timed out.")
             else:
-                await ctx.send(f"GitHub Error: {error_msg}")
+                await ctx.send(f"❌ GitHub Error: {error_msg}")
                 
         except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
+            await ctx.send(f"❌ Error: {str(e)}")
     
     @commands.command(name='create')
     async def cmd_create(self, ctx, filename: str, *, content: str):
@@ -497,13 +592,13 @@ class GitHubCommands(commands.Cog):
         # Get current repository
         current_repo = await get_current_repo(ctx.author.id, self.bot.db)
         if not current_repo or current_repo == DEFAULT_REPO:
-            await ctx.send("Please select a repository first using `--repo <name>`")
+            await ctx.send("❌ Please select a repository first using `--repo <name>`")
             return
         
         filename = sanitize_filename(filename)
         
         if len(content) > 10000:
-            await ctx.send("File too large (max 10KB)")
+            await ctx.send("❌ File too large (max 10KB)")
             return
         
         try:
@@ -532,6 +627,7 @@ class GitHubCommands(commands.Cog):
                     color=discord.Color.green()
                 )
                 embed.add_field(name="Size", value=f"{len(content)} characters", inline=True)
+                embed.add_field(name="Commit", value=response.get('commit', {}).get('sha', 'N/A')[:8], inline=True)
                 
                 if len(content) <= 500:
                     preview = content[:200] + "..." if len(content) > 200 else content
@@ -540,17 +636,17 @@ class GitHubCommands(commands.Cog):
                 await ctx.send(embed=embed)
             else:
                 error = response.get('message', f'Unknown error (status: {status})')
-                await ctx.send(f"Error: {error}")
+                await ctx.send(f"❌ Error: {error}")
                 
         except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
+            await ctx.send(f"❌ Error: {str(e)}")
     
     @commands.command(name='list')
-    async def cmd_list(self, ctx):
+    async def cmd_list(self, ctx, path: str = ""):
         """List files in current repository"""
         current_repo = await get_current_repo(ctx.author.id, self.bot.db)
         if not current_repo or current_repo == DEFAULT_REPO:
-            await ctx.send("Please select a repository first using `--repo <name>`")
+            await ctx.send("❌ Please select a repository first using `--repo <name>`")
             return
         
         try:
@@ -562,55 +658,56 @@ class GitHubCommands(commands.Cog):
                 repo_name = current_repo
             
             # Use GitHub API
-            status, response = await github_api_request(
-                "GET",
-                f"/repos/{owner}/{repo_name}/contents"
-            )
+            endpoint = f"/repos/{owner}/{repo_name}/contents/{path}" if path else f"/repos/{owner}/{repo_name}/contents"
+            status, response = await github_api_request("GET", endpoint)
             
             if status == 200:
                 files = []
                 directories = []
                 
                 for item in response:
-                    if item.get('type') == 'file':
-                        files.append(item.get('name', 'unknown'))
-                    elif item.get('type') == 'dir':
-                        directories.append(item.get('name', 'unknown'))
+                    item_type = item.get('type', 'unknown')
+                    name = item.get('name', 'unknown')
+                    if item_type == 'file':
+                        size = item.get('size', 0)
+                        files.append(f"📄 {name} ({size} bytes)")
+                    elif item_type == 'dir':
+                        directories.append(f"📁 {name}")
                 
                 embed = discord.Embed(
-                    title=f"📁 Contents of {repo_name}",
+                    title=f"📁 Contents of {repo_name}" + (f"/{path}" if path else ""),
                     color=discord.Color.purple()
                 )
                 
                 if files:
-                    file_list = "\n".join([f"• {f}" for f in files[:15]])
+                    file_list = "\n".join(files[:15])
                     if len(files) > 15:
-                        file_list += f"\n... and {len(files) - 15} more"
+                        file_list += f"\n... and {len(files) - 15} more files"
                     embed.add_field(name=f"Files ({len(files)})", value=file_list, inline=False)
                 
                 if directories:
-                    dir_list = "\n".join([f"• {d}" for d in directories[:10]])
+                    dir_list = "\n".join(directories[:10])
                     if len(directories) > 10:
-                        dir_list += f"\n... and {len(directories) - 10} more"
+                        dir_list += f"\n... and {len(directories) - 10} more directories"
                     embed.add_field(name=f"Directories ({len(directories)})", value=dir_list, inline=False)
                 
                 if not files and not directories:
-                    embed.description = "Repository is empty"
+                    embed.description = "📭 This directory is empty"
                 
                 await ctx.send(embed=embed)
             else:
                 error = response.get('message', f'Repository not found (status: {status})')
-                await ctx.send(f"Error: {error}")
+                await ctx.send(f"❌ Error: {error}")
                 
         except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
+            await ctx.send(f"❌ Error: {str(e)}")
     
     @commands.command(name='view')
     async def cmd_view(self, ctx, filename: str):
         """View a file"""
         current_repo = await get_current_repo(ctx.author.id, self.bot.db)
         if not current_repo or current_repo == DEFAULT_REPO:
-            await ctx.send("Please select a repository first using `--repo <name>`")
+            await ctx.send("❌ Please select a repository first using `--repo <name>`")
             return
         
         filename = sanitize_filename(filename)
@@ -630,17 +727,25 @@ class GitHubCommands(commands.Cog):
             )
             
             if status == 200:
-                content = base64.b64decode(response['content']).decode('utf-8')
+                content = decode_content(response['content'])
                 
+                # Truncate if too long
                 if len(content) > 1500:
-                    content = content[:1500] + "\n... (truncated)"
+                    content = content[:1500] + "\n... (truncated - file too large)"
                 
                 # Syntax highlighting
                 ext = filename.split('.')[-1].lower() if '.' in filename else 'txt'
                 languages = {
                     'py': 'python', 'js': 'javascript', 'ts': 'typescript',
                     'html': 'html', 'css': 'css', 'json': 'json',
-                    'md': 'markdown', 'txt': 'text'
+                    'md': 'markdown', 'txt': 'text', 'xml': 'xml',
+                    'yaml': 'yaml', 'yml': 'yaml', 'toml': 'toml',
+                    'ini': 'ini', 'cfg': 'ini', 'conf': 'ini',
+                    'sh': 'bash', 'bash': 'bash', 'zsh': 'bash',
+                    'cpp': 'cpp', 'c': 'c', 'h': 'c',
+                    'java': 'java', 'kt': 'kotlin', 'rs': 'rust',
+                    'go': 'go', 'php': 'php', 'rb': 'ruby',
+                    'sql': 'sql', 'swift': 'swift'
                 }
                 lang = languages.get(ext, 'text')
                 
@@ -649,21 +754,39 @@ class GitHubCommands(commands.Cog):
                     description=f"From `{repo_name}`",
                     color=discord.Color.blue()
                 )
+                embed.add_field(name="Size", value=f"{len(content)} characters", inline=True)
+                embed.add_field(name="SHA", value=response.get('sha', 'N/A')[:8], inline=True)
                 embed.add_field(name="Content", value=f"```{lang}\n{content}\n```", inline=False)
                 
                 await ctx.send(embed=embed)
             else:
                 error = response.get('message', 'File not found')
-                await ctx.send(f"Error: {error}")
+                await ctx.send(f"❌ Error: {error}")
                 
         except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
+            await ctx.send(f"❌ Error: {str(e)}")
     
     @commands.command(name='current')
     async def cmd_current(self, ctx):
         """Show current repository"""
         current_repo = await get_current_repo(ctx.author.id, self.bot.db)
-        await ctx.send(f"Current repository: `{current_repo}`")
+        embed = discord.Embed(
+            title="Current Repository",
+            description=f"`{current_repo}`",
+            color=discord.Color.blue()
+        )
+        
+        if self.bot.github_client and '/' in current_repo:
+            try:
+                repo = self.bot.github_client.get_repo(current_repo)
+                embed.add_field(name="Visibility", value="Private" if repo.private else "Public", inline=True)
+                embed.add_field(name="Stars", value=repo.stargazers_count, inline=True)
+                embed.add_field(name="Forks", value=repo.forks_count, inline=True)
+                embed.add_field(name="URL", value=repo.html_url, inline=False)
+            except:
+                pass
+        
+        await ctx.send(embed=embed)
     
     @commands.command(name='help')
     async def cmd_help(self, ctx):
@@ -675,24 +798,36 @@ class GitHubCommands(commands.Cog):
         )
         
         embed.add_field(
-            name="Basic Commands",
-            value=f"`{PREFIX}repo [name]` - Switch to repository\n"
-                  f"`{PREFIX}create [filename] [content]` - Create file\n"
-                  f"`{PREFIX}list` - List repository files\n"
-                  f"`{PREFIX}view [filename]` - View file\n"
-                  f"`{PREFIX}current` - Show current repo\n"
-                  f"`{PREFIX}debug` - Debug information\n"
-                  f"`{PREFIX}help` - This help",
+            name="📁 Repository Commands",
+            value=f"`{PREFIX}repo [name] [private]` - Switch to/create repository\n"
+                  f"`{PREFIX}current` - Show current repository\n"
+                  f"`{PREFIX}list [path]` - List repository contents",
             inline=False
         )
         
         embed.add_field(
-            name="Usage",
-            value=f"1. First, use `{PREFIX}repo your-repo-name`\n"
-                  f"2. Then create files with `{PREFIX}create`\n"
-                  f"3. Use `{PREFIX}debug` if you have issues",
+            name="📄 File Commands",
+            value=f"`{PREFIX}create [filename] [content]` - Create file\n"
+                  f"`{PREFIX}view [filename]` - View file content",
             inline=False
         )
+        
+        embed.add_field(
+            name="🔧 Utility Commands",
+            value=f"`{PREFIX}debug` - Debug information\n"
+                  f"`{PREFIX}help` - This help message\n"
+                  f"`{PREFIX}ping` - Check bot latency\n"
+                  f"`{PREFIX}stats` - Bot statistics",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⚙️ Admin Commands",
+            value=f"`{PREFIX}restart` - Restart the bot (owner only)",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"Prefix: {PREFIX} | Use slash commands for better experience")
         
         await ctx.send(embed=embed)
 
@@ -725,10 +860,59 @@ class GitHubCommands(commands.Cog):
         await self.cmd_debug(ctx)
     
     @app_commands.command(name="list", description="List repository files")
-    async def slash_list(self, interaction: discord.Interaction):
+    @app_commands.describe(
+        path="Optional path within repository"
+    )
+    async def slash_list(self, interaction: discord.Interaction, path: str = ""):
         await interaction.response.defer()
         ctx = await self.bot.get_context(interaction)
-        await self.cmd_list(ctx)
+        await self.cmd_list(ctx, path)
+
+# ========== UTILITY COMMANDS COG ==========
+
+class UtilityCommands(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+    
+    @commands.command(name='ping')
+    async def cmd_ping(self, ctx):
+        """Check bot latency"""
+        latency = round(self.bot.latency * 1000)
+        embed = discord.Embed(
+            title="🏓 Pong!",
+            description=f"Latency: **{latency}ms**",
+            color=discord.Color.green() if latency < 100 else discord.Color.orange() if latency < 200 else discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+    
+    @commands.command(name='stats')
+    async def cmd_stats(self, ctx):
+        """Show bot statistics"""
+        uptime = datetime.now() - self.bot.startup_time
+        days = uptime.days
+        hours, remainder = divmod(uptime.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        embed = discord.Embed(
+            title="📊 Bot Statistics",
+            color=discord.Color.purple()
+        )
+        
+        embed.add_field(name="Uptime", value=f"{days}d {hours}h {minutes}m {seconds}s", inline=True)
+        embed.add_field(name="Latency", value=f"{round(self.bot.latency * 1000)}ms", inline=True)
+        embed.add_field(name="Servers", value=len(self.bot.guilds), inline=True)
+        embed.add_field(name="GitHub User", value=self.bot.github_username, inline=True)
+        
+        if self.bot.github_client:
+            try:
+                rate_limit = self.bot.github_client.get_rate_limit().core
+                embed.add_field(name="GitHub Rate Limit", value=f"{rate_limit.remaining}/{rate_limit.limit}", inline=True)
+            except:
+                pass
+        
+        await ctx.send(embed=embed)
+
+# ========== ADMIN COMMANDS COG ==========
 
 class AdminCommands(commands.Cog):
     def __init__(self, bot):
@@ -738,7 +922,12 @@ class AdminCommands(commands.Cog):
     @commands.is_owner()
     async def cmd_restart(self, ctx):
         """Restart the bot"""
-        await ctx.send("Restarting bot...")
+        embed = discord.Embed(
+            title="🔄 Restarting",
+            description="Bot is restarting...",
+            color=discord.Color.orange()
+        )
+        await ctx.send(embed=embed)
         print("Bot restart initiated")
         os.execv(sys.executable, ['python'] + sys.argv)
 
@@ -747,14 +936,16 @@ class AdminCommands(commands.Cog):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
-        await ctx.send(f"Command not found. Use `{PREFIX}help` for available commands.")
+        await ctx.send(f"❌ Command not found. Use `{PREFIX}help` for available commands.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"Missing required argument. Use `{PREFIX}help {ctx.command.name}` for usage.")
+        await ctx.send(f"❌ Missing required argument. Use `{PREFIX}help {ctx.command.name}` for usage.")
     elif isinstance(error, commands.NotOwner):
-        await ctx.send("This command is for bot owners only.")
+        await ctx.send("❌ This command is for bot owners only.")
+    elif isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏳ Command on cooldown. Try again in {error.retry_after:.1f} seconds.")
     else:
         print(f"Command Error: {error}")
-        await ctx.send(f"An error occurred: {str(error)}")
+        await ctx.send(f"❌ An error occurred: {str(error)[:100]}")
 
 # ========== START BOT ==========
 
@@ -767,6 +958,8 @@ if __name__ == "__main__":
         bot.run(DISCORD_TOKEN)
     except KeyboardInterrupt:
         print("\nBot stopped by user")
+    except discord.LoginFailure:
+        print("❌ Failed to login to Discord. Check your DISCORD_TOKEN.")
     except Exception as e:
         print(f"❌ Bot crashed: {e}")
         import traceback
