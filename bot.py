@@ -74,12 +74,15 @@ class GitCordBot(commands.Bot):
         self.logger = FileLogger()
         
         if GITHUB_TOKEN:
-            self.github_client = Github(GITHUB_TOKEN)
             try:
+                self.github_client = Github(GITHUB_TOKEN)
+                # Test authentication
                 user = self.github_client.get_user()
                 print(f'GitHub authenticated as {user.login}')
+                print(f'GitHub rate limit: {self.github_client.get_rate_limit().core.remaining} requests remaining')
             except Exception as e:
                 print(f'GitHub authentication failed: {e}')
+                print('GitHub functionality will be limited')
 
 bot = GitCordBot()
 
@@ -465,12 +468,28 @@ async def create_github_repo(github_client, repo_name: str, is_private: bool = T
         repo = user.create_repo(
             name=repo_name,
             private=is_private,
-            auto_init=True,
-            description="Created via GitCord Bot"
+            auto_init=False,  # Changed to False to avoid initial README
+            description="Created via GitCord Bot",
+            has_issues=False,
+            has_wiki=False,
+            has_downloads=False,
+            has_projects=False
         )
         return repo, None
     except GithubException as e:
-        return None, str(e)
+        error_msg = str(e)
+        # Extract the actual error message
+        if "errors" in error_msg:
+            import json
+            try:
+                error_data = json.loads(error_msg.split(":", 1)[1].strip())
+                if "errors" in error_data:
+                    errors = error_data["errors"]
+                    if errors and "message" in errors[0]:
+                        error_msg = errors[0]["message"]
+            except:
+                pass
+        return None, error_msg
 
 async def github_api_request(method: str, endpoint: str, data: dict = None, token: str = GITHUB_TOKEN):
     headers = {
@@ -501,6 +520,7 @@ class GitHubCommands(commands.Cog):
     
     @commands.command(name='repo')
     async def cmd_repo(self, ctx, repo_name: str = None, private: str = "true"):
+        """Switch to or create a repository"""
         start_time = datetime.now()
         
         try:
@@ -512,20 +532,6 @@ class GitHubCommands(commands.Cog):
                     color=discord.Color.blue()
                 )
                 
-                try:
-                    if self.bot.github_client:
-                        repo = self.bot.github_client.get_repo(f"{GITHUB_USERNAME}/{current}")
-                        embed.add_field(name="URL", value=repo.html_url, inline=False)
-                        embed.add_field(name="Visibility", value="Private" if repo.private else "Public", inline=True)
-                        try:
-                            contents = repo.get_contents("")
-                            file_count = len([item for item in contents if item.type == "file"])
-                            embed.add_field(name="Files", value=str(file_count), inline=True)
-                        except:
-                            embed.add_field(name="Files", value="0", inline=True)
-                except Exception as e:
-                    embed.add_field(name="Status", value="Repository will be created on first use", inline=False)
-                
                 await ctx.send(embed=embed)
                 await log_command(ctx.author.id, 'repo', "check", True, self.bot.db, 
                                 execution_time=(datetime.now() - start_time).total_seconds())
@@ -535,7 +541,7 @@ class GitHubCommands(commands.Cog):
             is_private = private.lower() in ['true', 'yes', '1', 'private']
             
             if not self.bot.github_client:
-                await ctx.send("GitHub client not initialized")
+                await ctx.send("GitHub client not initialized. Check your GITHUB_TOKEN.")
                 return
             
             try:
@@ -550,30 +556,28 @@ class GitHubCommands(commands.Cog):
                 )
                 embed.add_field(name="URL", value=repo.html_url, inline=False)
                 embed.add_field(name="Visibility", value="Private" if repo.private else "Public", inline=True)
-                
-                try:
-                    contents = repo.get_contents("")
-                    file_count = len([item for item in contents if item.type == "file"])
-                    embed.add_field(name="Files", value=str(file_count), inline=True)
-                except:
-                    embed.add_field(name="Files", value="0", inline=True)
+                embed.add_field(name="Default Branch", value=repo.default_branch, inline=True)
                 
                 await ctx.send(embed=embed)
                 await log_command(ctx.author.id, 'repo', f"name={repo_name}", True, self.bot.db, 
                                 execution_time=(datetime.now() - start_time).total_seconds())
                 
             except GithubException as e:
-                # Check if it's a "not found" error or "already exists" error
+                # Repository doesn't exist - check error type
                 error_str = str(e)
-                if "Not Found" in error_str or "404" in error_str:
-                    # Repository doesn't exist - offer to create
+                if "404" in error_str or "Not Found" in error_str:
+                    # Repository truly doesn't exist
                     embed = discord.Embed(
-                        title="Repository Not Found",
-                        description=f"Repository `{repo_name}` doesn't exist. Create it?",
+                        title="Create Repository?",
+                        description=f"Repository `{repo_name}` doesn't exist.",
                         color=discord.Color.orange()
                     )
+                    embed.add_field(name="Visibility", value="Private" if is_private else "Public", inline=True)
+                    embed.add_field(name="Owner", value=GITHUB_USERNAME, inline=True)
                     
                     msg = await ctx.send(embed=embed)
+                    
+                    # Add reaction buttons
                     await msg.add_reaction("✅")
                     await msg.add_reaction("❌")
                     
@@ -628,11 +632,16 @@ class GitHubCommands(commands.Cog):
     
     @commands.command(name='create')
     async def cmd_create(self, ctx, filename: str, *, content: str):
+        """Create a new file"""
         start_time = datetime.now()
         
         try:
             repo_name = await get_current_repo(ctx.author.id, self.bot.db)
             filename = sanitize_filename(filename)
+            
+            if not repo_name:
+                await ctx.send("No repository selected. Use `--repo <name>` first.")
+                return
             
             if len(content) > 10000:
                 error = "File too large (max 10KB)"
@@ -642,21 +651,7 @@ class GitHubCommands(commands.Cog):
                                 execution_time=(datetime.now() - start_time).total_seconds())
                 return
             
-            # Check if file exists
-            status, existing = await github_api_request(
-                "GET",
-                f"/repos/{GITHUB_USERNAME}/{repo_name}/contents/{filename}"
-            )
-            
-            if status == 200:
-                error = "File already exists"
-                await ctx.send(f"{error}. Use `--edit` instead.")
-                self.bot.logger.log_failure(ctx.author.id, "create", filename, error, {"repo": repo_name})
-                await log_command(ctx.author.id, 'create', f"filename={filename}", False, self.bot.db, error, 
-                                execution_time=(datetime.now() - start_time).total_seconds())
-                return
-            
-            # Create file
+            # Create file with GitHub API
             status, response = await github_api_request(
                 "PUT",
                 f"/repos/{GITHUB_USERNAME}/{repo_name}/contents/{filename}",
@@ -685,8 +680,8 @@ class GitHubCommands(commands.Cog):
                 await log_command(ctx.author.id, 'create', f"filename={filename}", True, self.bot.db, 
                                 execution_time=(datetime.now() - start_time).total_seconds())
             else:
-                error = response.get('message', 'Unknown error')
-                await ctx.send(f"GitHub API Error: {error}")
+                error = response.get('message', f'Unknown error (status: {status})')
+                await ctx.send(f"Error: {error}")
                 self.bot.logger.log_failure(ctx.author.id, "create", filename, error, {"repo": repo_name, "status": status})
                 await log_command(ctx.author.id, 'create', f"filename={filename}", False, self.bot.db, error, 
                                 execution_time=(datetime.now() - start_time).total_seconds())
@@ -700,11 +695,16 @@ class GitHubCommands(commands.Cog):
     
     @commands.command(name='edit')
     async def cmd_edit(self, ctx, filename: str, *, content: str):
+        """Edit an existing file"""
         start_time = datetime.now()
         
         try:
             repo_name = await get_current_repo(ctx.author.id, self.bot.db)
             filename = sanitize_filename(filename)
+            
+            if not repo_name:
+                await ctx.send("No repository selected. Use `--repo <name>` first.")
+                return
             
             if len(content) > 10000:
                 error = "File too large (max 10KB)"
@@ -714,21 +714,28 @@ class GitHubCommands(commands.Cog):
                                 execution_time=(datetime.now() - start_time).total_seconds())
                 return
             
-            # Get existing file
+            # Get existing file SHA
             status, file_data = await github_api_request(
                 "GET",
                 f"/repos/{GITHUB_USERNAME}/{repo_name}/contents/{filename}"
             )
             
             if status != 200:
-                error = "File not found"
+                error = "File not found. Use `--create` to create a new file."
                 await ctx.send(f"{error}")
                 self.bot.logger.log_failure(ctx.author.id, "edit", filename, error, {"repo": repo_name})
                 await log_command(ctx.author.id, 'edit', f"filename={filename}", False, self.bot.db, error, 
                                 execution_time=(datetime.now() - start_time).total_seconds())
                 return
             
-            sha = file_data['sha']
+            sha = file_data.get('sha')
+            if not sha:
+                error = "Could not get file SHA"
+                await ctx.send(f"{error}")
+                self.bot.logger.log_failure(ctx.author.id, "edit", filename, error, {"repo": repo_name})
+                await log_command(ctx.author.id, 'edit', f"filename={filename}", False, self.bot.db, error, 
+                                execution_time=(datetime.now() - start_time).total_seconds())
+                return
             
             # Update file
             status, response = await github_api_request(
@@ -751,17 +758,14 @@ class GitHubCommands(commands.Cog):
                     description=f"Updated `{filename}` in `{repo_name}`",
                     color=discord.Color.green()
                 )
-                
-                old_content = base64.b64decode(file_data['content']).decode('utf-8')
-                embed.add_field(name="Previous size", value=f"{len(old_content)} characters", inline=True)
-                embed.add_field(name="New size", value=f"{len(content)} characters", inline=True)
+                embed.add_field(name="Size", value=f"{len(content)} characters", inline=True)
                 
                 await ctx.send(embed=embed)
                 await log_command(ctx.author.id, 'edit', f"filename={filename}", True, self.bot.db, 
                                 execution_time=(datetime.now() - start_time).total_seconds())
             else:
-                error = response.get('message', 'Unknown error')
-                await ctx.send(f"GitHub API Error: {error}")
+                error = response.get('message', f'Unknown error (status: {status})')
+                await ctx.send(f"Error: {error}")
                 self.bot.logger.log_failure(ctx.author.id, "edit", filename, error, {"repo": repo_name, "status": status})
                 await log_command(ctx.author.id, 'edit', f"filename={filename}", False, self.bot.db, error, 
                                 execution_time=(datetime.now() - start_time).total_seconds())
@@ -775,11 +779,16 @@ class GitHubCommands(commands.Cog):
     
     @commands.command(name='view')
     async def cmd_view(self, ctx, filename: str):
+        """View a file"""
         start_time = datetime.now()
         
         try:
             repo_name = await get_current_repo(ctx.author.id, self.bot.db)
             filename = sanitize_filename(filename)
+            
+            if not repo_name:
+                await ctx.send("No repository selected. Use `--repo <name>` first.")
+                return
             
             status, response = await github_api_request(
                 "GET",
@@ -825,6 +834,7 @@ class GitHubCommands(commands.Cog):
     
     @commands.command(name='list')
     async def cmd_list(self, ctx):
+        """List files in repository"""
         start_time = datetime.now()
         
         try:
@@ -834,7 +844,7 @@ class GitHubCommands(commands.Cog):
                 await ctx.send("No repository selected. Use `--repo <name>` first.")
                 return
             
-            # Try GitHub API first
+            # Use GitHub API to list contents
             status, response = await github_api_request(
                 "GET",
                 f"/repos/{GITHUB_USERNAME}/{repo_name}/contents"
@@ -844,21 +854,18 @@ class GitHubCommands(commands.Cog):
                 files = []
                 directories = []
                 
-                for item in response:
-                    if isinstance(item, dict):
+                if isinstance(response, list):
+                    for item in response:
                         if item.get('type') == 'file':
                             files.append(item.get('name', 'unknown'))
                         elif item.get('type') == 'dir':
                             directories.append(item.get('name', 'unknown'))
-                    else:
-                        # Fallback for list structure
-                        if 'type' in item and item['type'] == 'file':
-                            files.append(item.get('name', 'unknown'))
-                        elif 'type' in item and item['type'] == 'dir':
-                            directories.append(item.get('name', 'unknown'))
+                elif isinstance(response, dict) and response.get('type') == 'file':
+                    # Single file repository
+                    files.append(response.get('name', 'unknown'))
                 
                 embed = discord.Embed(
-                    title=f"{repo_name}",
+                    title=f"Contents of {repo_name}",
                     color=discord.Color.purple()
                 )
                 
@@ -875,57 +882,16 @@ class GitHubCommands(commands.Cog):
                     embed.add_field(name=f"Directories ({len(directories)})", value=dir_list, inline=False)
                 
                 if not files and not directories:
-                    embed.description = "Repository is empty or doesn't exist"
+                    embed.description = "Repository is empty"
                 
                 await ctx.send(embed=embed)
                 await log_command(ctx.author.id, 'list', "", True, self.bot.db, 
                                 execution_time=(datetime.now() - start_time).total_seconds())
             else:
-                # Try PyGithub as fallback
-                try:
-                    if self.bot.github_client:
-                        repo = self.bot.github_client.get_repo(f"{GITHUB_USERNAME}/{repo_name}")
-                        contents = repo.get_contents("")
-                        
-                        files = []
-                        directories = []
-                        
-                        for content in contents:
-                            if content.type == "file":
-                                files.append(content.name)
-                            elif content.type == "dir":
-                                directories.append(content.name)
-                        
-                        embed = discord.Embed(
-                            title=f"{repo_name}",
-                            color=discord.Color.purple()
-                        )
-                        
-                        if files:
-                            file_list = "\n".join([f"{f}" for f in files[:20]])
-                            if len(files) > 20:
-                                file_list += f"\n... and {len(files) - 20} more"
-                            embed.add_field(name=f"Files ({len(files)})", value=file_list, inline=False)
-                        
-                        if directories:
-                            dir_list = "\n".join([f"{d}" for d in directories[:10]])
-                            if len(directories) > 10:
-                                dir_list += f"\n... and {len(directories) - 10} more"
-                            embed.add_field(name=f"Directories ({len(directories)})", value=dir_list, inline=False)
-                        
-                        await ctx.send(embed=embed)
-                        await log_command(ctx.author.id, 'list', "", True, self.bot.db, 
-                                        execution_time=(datetime.now() - start_time).total_seconds())
-                    else:
-                        error = "GitHub client not available"
-                        await ctx.send(f"Error: {error}")
-                        await log_command(ctx.author.id, 'list', "", False, self.bot.db, error, 
-                                        execution_time=(datetime.now() - start_time).total_seconds())
-                except Exception as e:
-                    error = f"Repository not found or empty: {str(e)}"
-                    await ctx.send(f"Error: {error}")
-                    await log_command(ctx.author.id, 'list', "", False, self.bot.db, error, 
-                                    execution_time=(datetime.now() - start_time).total_seconds())
+                error = response.get('message', f'Repository not found (status: {status})')
+                await ctx.send(f"Error: {error}")
+                await log_command(ctx.author.id, 'list', "", False, self.bot.db, error, 
+                                execution_time=(datetime.now() - start_time).total_seconds())
                 
         except Exception as e:
             error_msg = str(e)
@@ -935,11 +901,16 @@ class GitHubCommands(commands.Cog):
     
     @commands.command(name='delete')
     async def cmd_delete(self, ctx, filename: str):
+        """Delete a file"""
         start_time = datetime.now()
         
         try:
             repo_name = await get_current_repo(ctx.author.id, self.bot.db)
             filename = sanitize_filename(filename)
+            
+            if not repo_name:
+                await ctx.send("No repository selected. Use `--repo <name>` first.")
+                return
             
             # Get file SHA first
             status, file_data = await github_api_request(
@@ -955,7 +926,14 @@ class GitHubCommands(commands.Cog):
                                 execution_time=(datetime.now() - start_time).total_seconds())
                 return
             
-            sha = file_data['sha']
+            sha = file_data.get('sha')
+            if not sha:
+                error = "Could not get file SHA"
+                await ctx.send(f"{error}")
+                self.bot.logger.log_failure(ctx.author.id, "delete", filename, error, {"repo": repo_name})
+                await log_command(ctx.author.id, 'delete', f"filename={filename}", False, self.bot.db, error, 
+                                execution_time=(datetime.now() - start_time).total_seconds())
+                return
             
             # Confirm deletion
             embed = discord.Embed(
@@ -995,7 +973,7 @@ class GitHubCommands(commands.Cog):
                         await log_command(ctx.author.id, 'delete', f"filename={filename}", True, self.bot.db, 
                                         execution_time=(datetime.now() - start_time).total_seconds())
                     else:
-                        error = response.get('message', 'Unknown error')
+                        error = response.get('message', f'Delete failed (status: {status})')
                         await ctx.send(f"Delete failed: {error}")
                         self.bot.logger.log_failure(ctx.author.id, "delete", filename, error, {"repo": repo_name, "status": status})
                         await log_command(ctx.author.id, 'delete', f"filename={filename}", False, self.bot.db, error, 
@@ -1019,11 +997,16 @@ class GitHubCommands(commands.Cog):
     
     @commands.command(name='current')
     async def cmd_current(self, ctx):
+        """Show current repository"""
         repo_name = await get_current_repo(ctx.author.id, self.bot.db)
-        await ctx.send(f"Current repository: `{repo_name}`")
+        if repo_name:
+            await ctx.send(f"Current repository: `{repo_name}`")
+        else:
+            await ctx.send("No repository selected. Use `--repo <name>` first.")
     
     @commands.command(name='stats')
     async def cmd_stats(self, ctx, user: discord.User = None):
+        """Show user statistics"""
         start_time = datetime.now()
         
         try:
@@ -1063,6 +1046,7 @@ class GitHubCommands(commands.Cog):
     
     @commands.command(name='history')
     async def cmd_history(self, ctx, limit: int = 10):
+        """Show file history"""
         start_time = datetime.now()
         
         try:
@@ -1101,6 +1085,7 @@ class GitHubCommands(commands.Cog):
     
     @commands.command(name='template')
     async def cmd_template(self, ctx, action: str = None, template_name: str = None, *, content: str = None):
+        """Manage file templates"""
         if action == "create" and template_name and content:
             await self.bot.db.execute(
                 'INSERT INTO file_templates (user_id, template_name, content_template) VALUES ($1, $2, $3) ON CONFLICT (user_id, template_name) DO UPDATE SET content_template = $3',
@@ -1132,6 +1117,7 @@ class GitHubCommands(commands.Cog):
     
     @commands.command(name='prefix')
     async def cmd_prefix(self, ctx, new_prefix: str = None):
+        """Set your command prefix"""
         if not new_prefix:
             settings = await get_user_settings(ctx.author.id, self.bot.db)
             current = settings.get('preferred_prefix', PREFIX)
@@ -1208,6 +1194,7 @@ class AdminCommands(commands.Cog):
     @commands.command(name='restart')
     @commands.is_owner()
     async def cmd_restart(self, ctx):
+        """Restart the bot"""
         await ctx.send("Restarting bot...")
         print("Bot restart initiated")
         os.execv(sys.executable, ['python'] + sys.argv)
@@ -1215,6 +1202,7 @@ class AdminCommands(commands.Cog):
     @commands.command(name='logs')
     @commands.is_owner()
     async def cmd_logs(self, ctx, hours: int = 24):
+        """Show recent failures"""
         if hours > 168:
             hours = 168
         
@@ -1245,6 +1233,7 @@ class AdminCommands(commands.Cog):
     @commands.command(name='status')
     @commands.is_owner()
     async def cmd_status(self, ctx):
+        """Show bot status"""
         embed = discord.Embed(
             title="Bot Status",
             color=discord.Color.blue()
@@ -1263,6 +1252,8 @@ class AdminCommands(commands.Cog):
             try:
                 user = self.bot.github_client.get_user()
                 embed.add_field(name="GitHub", value=f"Connected as {user.login}", inline=True)
+                rate_limit = self.bot.github_client.get_rate_limit().core
+                embed.add_field(name="GitHub Rate Limit", value=f"{rate_limit.remaining}/{rate_limit.limit}", inline=True)
             except:
                 embed.add_field(name="GitHub", value="Disconnected", inline=True)
         else:
@@ -1273,6 +1264,7 @@ class AdminCommands(commands.Cog):
     @commands.command(name='cleanup')
     @commands.is_owner()
     async def cmd_cleanup(self, ctx, days: int = 30):
+        """Clean up old database entries"""
         deleted = await self.bot.db.fetchval(
             'DELETE FROM command_logs WHERE created_at < NOW() - INTERVAL \'$1 days\' RETURNING COUNT(*)',
             days
@@ -1283,6 +1275,7 @@ class AdminCommands(commands.Cog):
 
 @bot.command(name='help')
 async def cmd_help(ctx, command: str = None):
+    """Show help"""
     if command:
         commands_info = {
             'repo': "Switch to/create repository\nUsage: `--repo [name] [private=true/false]`",
