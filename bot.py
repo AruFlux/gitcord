@@ -696,6 +696,40 @@ class GitHubCommands(commands.Cog):
         
         await ctx.send(embed=embed)
 
+    # ========== SLASH COMMANDS ==========
+    
+    @app_commands.command(name="repo", description="Switch to a repository")
+    @app_commands.describe(
+        repo_name="Repository name",
+        private="Make private (true/false)"
+    )
+    async def slash_repo(self, interaction: discord.Interaction, repo_name: str, private: bool = True):
+        await interaction.response.defer()
+        ctx = await self.bot.get_context(interaction)
+        await self.cmd_repo(ctx, repo_name, "true" if private else "false")
+    
+    @app_commands.command(name="create", description="Create a new file")
+    @app_commands.describe(
+        filename="File name",
+        content="File content"
+    )
+    async def slash_create(self, interaction: discord.Interaction, filename: str, content: str):
+        await interaction.response.defer()
+        ctx = await self.bot.get_context(interaction)
+        await self.cmd_create(ctx, filename, content=content)
+    
+    @app_commands.command(name="debug", description="Debug information")
+    async def slash_debug(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        ctx = await self.bot.get_context(interaction)
+        await self.cmd_debug(ctx)
+    
+    @app_commands.command(name="list", description="List repository files")
+    async def slash_list(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        ctx = await self.bot.get_context(interaction)
+        await self.cmd_list(ctx)
+
 class AdminCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -705,31 +739,8 @@ class AdminCommands(commands.Cog):
     async def cmd_restart(self, ctx):
         """Restart the bot"""
         await ctx.send("Restarting bot...")
+        print("Bot restart initiated")
         os.execv(sys.executable, ['python'] + sys.argv)
-
-# ========== SLASH COMMANDS ==========
-
-@GitHubCommands.app_commands.command(name="repo", description="Switch to a repository")
-@app_commands.describe(
-    repo_name="Repository name",
-    private="Make private (true/false)"
-)
-async def slash_repo(interaction: discord.Interaction, repo_name: str, private: bool = True):
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction)
-    cog = bot.get_cog('GitHubCommands')
-    await cog.cmd_repo(ctx, repo_name, "true" if private else "false")
-
-@GitHubCommands.app_commands.command(name="create", description="Create a new file")
-@app_commands.describe(
-    filename="File name",
-    content="File content"
-)
-async def slash_create(interaction: discord.Interaction, filename: str, content: str):
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction)
-    cog = bot.get_cog('GitHubCommands')
-    await cog.cmd_create(ctx, filename, content=content)
 
 # ========== ERROR HANDLING ==========
 
