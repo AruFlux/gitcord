@@ -6,11 +6,11 @@ import os
 import sys
 import asyncio
 import base64
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from github import Github, GithubException
 from dotenv import load_dotenv
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 import aiosqlite
 import psycopg2
 from contextlib import closing
@@ -57,6 +57,7 @@ class GitCordBot(commands.Bot):
         self.github_client = None
         self.github_username = GITHUB_USERNAME
         self.startup_time = datetime.now()
+        self.github_handler = None
     
     async def get_prefix(self, message):
         """Dynamic prefix based on user settings"""
@@ -64,12 +65,16 @@ class GitCordBot(commands.Bot):
             return DEFAULT_PREFIX
         
         try:
-            settings = await get_user_settings(message.author.id, self.db)
-            return settings.get('preferred_prefix', DEFAULT_PREFIX)
+            prefix = await self.db.get_user_prefix(message.author.id)
+            return prefix or DEFAULT_PREFIX
         except:
             return DEFAULT_PREFIX
     
     async def setup_hook(self):
+        # Initialize handlers first
+        await self.initialize_systems()
+        
+        # Then add cogs
         await self.add_cog(GitHubCommands(self))
         await self.add_cog(AdminCommands(self))
         await self.add_cog(UtilityCommands(self))
@@ -80,27 +85,20 @@ class GitCordBot(commands.Bot):
         print(f'Default Prefix: {DEFAULT_PREFIX}')
         print(f'GitHub User: {self.github_username}')
         
-        # Initialize systems
-        success = await self.initialize_systems()
-        if not success:
-            print('Some systems failed to initialize')
-        
         await self.change_presence(activity=discord.Activity(
             type=discord.ActivityType.watching,
             name="GitHub repositories"
         ))
 
     async def initialize_systems(self):
-        """Initialize all systems, return True if all successful"""
-        all_success = True
-        
+        """Initialize all systems"""
         # Database
         self.db = DatabaseManager()
         if await self.db.initialize():
             print('Database connected')
         else:
             print('Database not available')
-            all_success = False
+            return False
         
         # GitHub client
         try:
@@ -117,14 +115,17 @@ class GitCordBot(commands.Bot):
             rate_limit = self.github_client.get_rate_limit().core
             print(f'GitHub Rate Limit: {rate_limit.remaining}/{rate_limit.limit}')
             
+            # Initialize GitHub handler
+            self.github_handler = GitHubHandler(self.github_client, self.db)
+            
         except GithubException as e:
             print(f'GitHub API Error: {e.status} - {e.data.get("message", "Unknown error")}')
-            all_success = False
+            return False
         except Exception as e:
             print(f'GitHub authentication failed: {e}')
-            all_success = False
+            return False
         
-        return all_success
+        return True
 
 bot = GitCordBot()
 
@@ -261,10 +262,12 @@ class DatabaseManager:
                         return dict(zip([desc[0] for desc in cur.description], row))
                     return None
             elif self.db_type == "sqlite":
-                cursor = await self.sqlite_conn.execute(query, args)
-                row = await cursor.fetchone()
-                await cursor.close()
-                return dict(row) if row else None
+                async with self.sqlite_conn.execute(query, args) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        columns = [desc[0] for desc in cursor.description]
+                        return dict(zip(columns, row))
+                    return None
         except Exception as e:
             print(f"Database fetchrow error: {e}")
             return None
@@ -280,13 +283,83 @@ class DatabaseManager:
                         return [dict(zip(columns, row)) for row in rows]
                     return []
             elif self.db_type == "sqlite":
-                cursor = await self.sqlite_conn.execute(query, args)
-                rows = await cursor.fetchall()
-                await cursor.close()
-                return [dict(row) for row in rows] if rows else []
+                async with self.sqlite_conn.execute(query, args) as cursor:
+                    rows = await cursor.fetchall()
+                    if rows and cursor.description:
+                        columns = [desc[0] for desc in cursor.description]
+                        return [dict(zip(columns, row)) for row in rows]
+                    return []
         except Exception as e:
             print(f"Database fetch error: {e}")
             return []
+    
+    async def get_user_settings(self, user_id: int) -> Dict[str, Any]:
+        """Get all user settings"""
+        return await self.fetchrow('SELECT * FROM user_settings WHERE user_id = $1', user_id) or {}
+    
+    async def update_user_settings(self, user_id: int, **kwargs):
+        """Update user settings"""
+        settings = await self.get_user_settings(user_id)
+        
+        if settings:
+            set_clause = ', '.join([f"{k} = ${i+2}" for i, k in enumerate(kwargs.keys())])
+            values = [user_id] + list(kwargs.values())
+            await self.execute(
+                f'UPDATE user_settings SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE user_id = $1',
+                *values
+            )
+        else:
+            columns = ['user_id'] + list(kwargs.keys())
+            placeholders = ', '.join([f'${i+1}' for i in range(len(columns))])
+            values = [user_id] + list(kwargs.values())
+            await self.execute(
+                f'INSERT INTO user_settings ({", ".join(columns)}) VALUES ({placeholders})',
+                *values
+            )
+    
+    async def get_user_repo(self, user_id: int) -> str:
+        """Get current repository for user"""
+        settings = await self.get_user_settings(user_id)
+        return settings.get('default_repo', DEFAULT_REPO)
+    
+    async def set_user_repo(self, user_id: int, repo_name: str):
+        """Set current repository for user"""
+        await self.update_user_settings(user_id, default_repo=repo_name)
+    
+    async def get_user_branch(self, user_id: int) -> str:
+        """Get current branch for user"""
+        settings = await self.get_user_settings(user_id)
+        return settings.get('current_branch', 'main')
+    
+    async def set_user_branch(self, user_id: int, branch_name: str):
+        """Set current branch for user"""
+        await self.update_user_settings(user_id, current_branch=branch_name)
+    
+    async def get_user_commit_message(self, user_id: int) -> str:
+        """Get commit message for user"""
+        settings = await self.get_user_settings(user_id)
+        return settings.get('commit_message', 'Update via GitCord')
+    
+    async def set_user_commit_message(self, user_id: int, message: str):
+        """Set commit message for user"""
+        await self.update_user_settings(user_id, commit_message=message)
+    
+    async def get_user_prefix(self, user_id: int) -> str:
+        """Get command prefix for user"""
+        settings = await self.get_user_settings(user_id)
+        return settings.get('preferred_prefix', DEFAULT_PREFIX)
+    
+    async def set_user_prefix(self, user_id: int, prefix: str):
+        """Set command prefix for user"""
+        await self.update_user_settings(user_id, preferred_prefix=prefix)
+    
+    async def log_command(self, user_id: int, command: str, arguments: str, success: bool, 
+                         error_message: str = None, execution_time: float = 0.0):
+        """Log command execution"""
+        await self.execute(
+            'INSERT INTO command_logs (user_id, command, arguments, success, error_message, execution_time) VALUES ($1, $2, $3, $4, $5, $6)',
+            user_id, command, arguments, success, error_message, execution_time
+        )
     
     async def close(self):
         try:
@@ -297,6 +370,278 @@ class DatabaseManager:
         except Exception as e:
             print(f"Database close error: {e}")
 
+# ========== GITHUB HANDLER ==========
+
+class GitHubHandler:
+    """Centralized GitHub operations handler"""
+    
+    def __init__(self, github_client: Github, db: DatabaseManager):
+        self.github_client = github_client
+        self.db = db
+    
+    async def get_user_context(self, user_id: int) -> Tuple[str, str, str]:
+        """Get user's current repo, branch, and commit message"""
+        repo = await self.db.get_user_repo(user_id)
+        branch = await self.db.get_user_branch(user_id)
+        commit_msg = await self.db.get_user_commit_message(user_id)
+        return repo, branch, commit_msg
+    
+    async def validate_user_context(self, user_id: int) -> Tuple[bool, str]:
+        """Validate user has proper context set up"""
+        repo, branch, _ = await self.get_user_context(user_id)
+        
+        if not repo or repo == DEFAULT_REPO:
+            return False, "Please select a repository first using `--repo <name>`"
+        
+        return True, ""
+    
+    def parse_repo_full_name(self, repo_full_name: str) -> Tuple[str, str]:
+        """Parse owner and repo name from full name"""
+        if '/' in repo_full_name:
+            owner, repo_name = repo_full_name.split('/', 1)
+        else:
+            owner = bot.github_username
+            repo_name = repo_full_name
+        return owner, repo_name
+    
+    async def api_request(self, method: str, endpoint: str, data: dict = None):
+        """Make GitHub API request with proper error handling"""
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "GitCord-Bot"
+        }
+        
+        url = f"https://api.github.com{endpoint}"
+        
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.request(method, url, headers=headers, json=data, timeout=30) as response:
+                    if response.status == 204:
+                        return response.status, {}
+                    response_data = await response.json() if response.content_length else {}
+                    return response.status, response_data
+            except asyncio.TimeoutError:
+                return 408, {"message": "Request timeout"}
+            except Exception as e:
+                return 500, {"message": str(e)}
+    
+    async def get_file_sha(self, owner: str, repo_name: str, filename: str, branch: str) -> Optional[str]:
+        """Get SHA hash of existing file"""
+        status, response = await self.api_request(
+            "GET",
+            f"/repos/{owner}/{repo_name}/contents/{filename}?ref={branch}"
+        )
+        
+        if status == 200:
+            return response.get('sha')
+        return None
+    
+    async def create_file(self, user_id: int, filename: str, content: str) -> Tuple[bool, str]:
+        """Create a new file in user's current repo/branch"""
+        valid, error = await self.validate_user_context(user_id)
+        if not valid:
+            return False, error
+        
+        repo_full, branch, commit_msg = await self.get_user_context(user_id)
+        owner, repo_name = self.parse_repo_full_name(repo_full)
+        
+        # Encode content
+        encoded_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+        
+        # Create file
+        status, response = await self.api_request(
+            "PUT",
+            f"/repos/{owner}/{repo_name}/contents/{filename}",
+            {
+                "message": commit_msg,
+                "content": encoded_content,
+                "branch": branch
+            }
+        )
+        
+        if status == 201:
+            return True, f"Created `{filename}` in `{repo_full}` (branch: {branch})"
+        else:
+            error = response.get('message', f'Unknown error (status: {status})')
+            return False, f"Error: {error}"
+    
+    async def edit_file(self, user_id: int, filename: str, content: str) -> Tuple[bool, str]:
+        """Edit an existing file"""
+        valid, error = await self.validate_user_context(user_id)
+        if not valid:
+            return False, error
+        
+        repo_full, branch, commit_msg = await self.get_user_context(user_id)
+        owner, repo_name = self.parse_repo_full_name(repo_full)
+        
+        # Get existing file SHA
+        sha = await self.get_file_sha(owner, repo_name, filename, branch)
+        if not sha:
+            return False, f"File `{filename}` not found in repository"
+        
+        # Encode content
+        encoded_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+        
+        # Update file
+        status, response = await self.api_request(
+            "PUT",
+            f"/repos/{owner}/{repo_name}/contents/{filename}",
+            {
+                "message": commit_msg,
+                "content": encoded_content,
+                "sha": sha,
+                "branch": branch
+            }
+        )
+        
+        if status == 200:
+            return True, f"Updated `{filename}` in `{repo_full}` (branch: {branch})"
+        else:
+            error = response.get('message', f'Unknown error (status: {status})')
+            return False, f"Error: {error}"
+    
+    async def delete_file(self, user_id: int, filename: str) -> Tuple[bool, str]:
+        """Delete a file"""
+        valid, error = await self.validate_user_context(user_id)
+        if not valid:
+            return False, error
+        
+        repo_full, branch, commit_msg = await self.get_user_context(user_id)
+        owner, repo_name = self.parse_repo_full_name(repo_full)
+        
+        # Get existing file SHA
+        sha = await self.get_file_sha(owner, repo_name, filename, branch)
+        if not sha:
+            return False, f"File `{filename}` not found in repository"
+        
+        # Delete file
+        status, response = await self.api_request(
+            "DELETE",
+            f"/repos/{owner}/{repo_name}/contents/{filename}",
+            {
+                "message": commit_msg,
+                "sha": sha,
+                "branch": branch
+            }
+        )
+        
+        if status == 200:
+            return True, f"Deleted `{filename}` from `{repo_full}` (branch: {branch})"
+        else:
+            error = response.get('message', f'Unknown error (status: {status})')
+            return False, f"Error: {error}"
+    
+    async def view_file(self, user_id: int, filename: str) -> Tuple[bool, str, Optional[str]]:
+        """View file content"""
+        valid, error = await self.validate_user_context(user_id)
+        if not valid:
+            return False, error, None
+        
+        repo_full, branch, _ = await self.get_user_context(user_id)
+        owner, repo_name = self.parse_repo_full_name(repo_full)
+        
+        # Get file content
+        status, response = await self.api_request(
+            "GET",
+            f"/repos/{owner}/{repo_name}/contents/{filename}?ref={branch}"
+        )
+        
+        if status == 200:
+            try:
+                content = base64.b64decode(response['content']).decode('utf-8')
+                return True, f"File `{filename}` from `{repo_full}` (branch: {branch})", content
+            except:
+                return False, "Failed to decode file content", None
+        else:
+            error = response.get('message', 'File not found')
+            return False, f"Error: {error}", None
+    
+    async def list_files(self, user_id: int, path: str = "") -> Tuple[bool, str, List[Dict]]:
+        """List files in repository"""
+        valid, error = await self.validate_user_context(user_id)
+        if not valid:
+            return False, error, []
+        
+        repo_full, branch, _ = await self.get_user_context(user_id)
+        owner, repo_name = self.parse_repo_full_name(repo_full)
+        
+        # Get repository contents
+        endpoint = f"/repos/{owner}/{repo_name}/contents/{path}?ref={branch}" if path else f"/repos/{owner}/{repo_name}/contents?ref={branch}"
+        status, response = await self.api_request("GET", endpoint)
+        
+        if status == 200:
+            return True, f"Contents of `{repo_full}` (branch: {branch})", response
+        else:
+            error = response.get('message', f'Repository not found (status: {status})')
+            return False, f"Error: {error}", []
+    
+    async def get_branches(self, user_id: int) -> Tuple[bool, str, List[str]]:
+        """Get list of branches in current repository"""
+        valid, error = await self.validate_user_context(user_id)
+        if not valid:
+            return False, error, []
+        
+        repo_full, _, _ = await self.get_user_context(user_id)
+        owner, repo_name = self.parse_repo_full_name(repo_full)
+        
+        # Get branches
+        status, response = await self.api_request(
+            "GET",
+            f"/repos/{owner}/{repo_name}/branches"
+        )
+        
+        if status == 200:
+            branches = [branch['name'] for branch in response]
+            return True, f"Branches in `{repo_full}`", branches
+        else:
+            error = response.get('message', f'Unknown error (status: {status})')
+            return False, f"Error: {error}", []
+    
+    async def create_branch(self, user_id: int, branch_name: str) -> Tuple[bool, str]:
+        """Create a new branch"""
+        valid, error = await self.validate_user_context(user_id)
+        if not valid:
+            return False, error
+        
+        repo_full, _, _ = await self.get_user_context(user_id)
+        owner, repo_name = self.parse_repo_full_name(repo_full)
+        
+        # Get default branch SHA
+        default_branch_status, default_branch_response = await self.api_request(
+            "GET",
+            f"/repos/{owner}/{repo_name}/git/refs/heads/main"
+        )
+        
+        if default_branch_status != 200:
+            # Try master instead
+            default_branch_status, default_branch_response = await self.api_request(
+                "GET",
+                f"/repos/{owner}/{repo_name}/git/refs/heads/master"
+            )
+        
+        if default_branch_status == 200:
+            sha = default_branch_response['object']['sha']
+            
+            # Create new branch
+            create_status, create_response = await self.api_request(
+                "POST",
+                f"/repos/{owner}/{repo_name}/git/refs",
+                {
+                    "ref": f"refs/heads/{branch_name}",
+                    "sha": sha
+                }
+            )
+            
+            if create_status == 201:
+                await self.db.set_user_branch(user_id, branch_name)
+                return True, f"Created and switched to branch: `{branch_name}`"
+            else:
+                error = create_response.get('message', 'Failed to create branch')
+                return False, f"Error: {error}"
+        else:
+            return False, "Could not find default branch to create from"
+
 # ========== HELPER FUNCTIONS ==========
 
 def sanitize_filename(filename: str) -> str:
@@ -305,132 +650,28 @@ def sanitize_filename(filename: str) -> str:
     filename = re.sub(r'[^a-zA-Z0-9._-]', '', filename)
     return filename
 
-def encode_content(content: str) -> str:
-    """Base64 encode content for GitHub API"""
-    return base64.b64encode(content.encode('utf-8')).decode('utf-8')
-
-def decode_content(encoded_content: str) -> str:
-    """Base64 decode content from GitHub API"""
-    return base64.b64decode(encoded_content).decode('utf-8')
-
-async def get_user_settings(user_id: int, db: DatabaseManager) -> Dict[str, Any]:
-    """Get user settings from database"""
-    if not db:
-        return {}
-    
-    row = await db.fetchrow('SELECT * FROM user_settings WHERE user_id = $1', user_id)
-    return row or {}
-
-async def update_user_settings(user_id: int, db: DatabaseManager, **kwargs):
-    """Update user settings in database"""
-    if not db:
-        return
-    
-    settings = await get_user_settings(user_id, db)
-    
-    if settings:
-        set_clause = ', '.join([f"{k} = ${i+2}" for i, k in enumerate(kwargs.keys())])
-        values = [user_id] + list(kwargs.values())
-        await db.execute(
-            f'UPDATE user_settings SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE user_id = $1',
-            *values
-        )
-    else:
-        columns = ['user_id'] + list(kwargs.keys())
-        placeholders = ', '.join([f'${i+1}' for i in range(len(columns))])
-        values = [user_id] + list(kwargs.values())
-        await db.execute(
-            f'INSERT INTO user_settings ({", ".join(columns)}) VALUES ({placeholders})',
-            *values
-        )
-
-async def get_current_repo(user_id: int, db: DatabaseManager) -> str:
-    """Get current repository for user"""
-    settings = await get_user_settings(user_id, db)
-    return settings.get('default_repo', DEFAULT_REPO)
-
-async def set_current_repo(user_id: int, repo_name: str, db: DatabaseManager):
-    """Set current repository for user"""
-    await update_user_settings(user_id, db, default_repo=repo_name)
-
-async def get_current_branch(user_id: int, db: DatabaseManager) -> str:
-    """Get current branch for user"""
-    settings = await get_user_settings(user_id, db)
-    return settings.get('current_branch', 'main')
-
-async def set_current_branch(user_id: int, branch_name: str, db: DatabaseManager):
-    """Set current branch for user"""
-    await update_user_settings(user_id, db, current_branch=branch_name)
-
-async def get_commit_message(user_id: int, db: DatabaseManager) -> str:
-    """Get commit message for user"""
-    settings = await get_user_settings(user_id, db)
-    return settings.get('commit_message', 'Update via GitCord')
-
-async def set_commit_message(user_id: int, message: str, db: DatabaseManager):
-    """Set commit message for user"""
-    await update_user_settings(user_id, db, commit_message=message)
-
-async def get_file_sha(owner: str, repo_name: str, filename: str, branch: str = "main") -> Optional[str]:
-    """Get SHA hash of existing file for update operations"""
-    status, response = await github_api_request(
-        "GET",
-        f"/repos/{owner}/{repo_name}/contents/{filename}?ref={branch}"
-    )
-    
-    if status == 200:
-        return response.get('sha')
-    return None
-
-async def github_api_request(method: str, endpoint: str, data: dict = None):
-    """Make GitHub API request"""
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "GitCord-Bot"
-    }
-    
-    url = f"https://api.github.com{endpoint}"
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.request(method, url, headers=headers, json=data, timeout=30) as response:
-                if response.status == 204:
-                    return response.status, {}
-                response_data = await response.json() if response.content_length else {}
-                return response.status, response_data
-        except asyncio.TimeoutError:
-            return 408, {"message": "Request timeout"}
-        except Exception as e:
-            return 500, {"message": str(e)}
-
-async def log_command(user_id: int, command: str, arguments: str, success: bool, 
-                     db: DatabaseManager, error_message: str = None, execution_time: float = 0.0):
-    """Log command execution"""
-    if not db:
-        return
-    
-    await db.execute(
-        'INSERT INTO command_logs (user_id, command, arguments, success, error_message, execution_time) VALUES ($1, $2, $3, $4, $5, $6)',
-        user_id, command, arguments, success, error_message, execution_time
-    )
-
 # ========== GITHUB COMMANDS COG ==========
 
 class GitHubCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
     
+    async def _ensure_github_ready(self, ctx) -> bool:
+        """Ensure GitHub client is ready"""
+        if not self.bot.github_client or not self.bot.github_handler:
+            await ctx.send("GitHub client not ready. Please wait for bot initialization.")
+            return False
+        return True
+    
     @commands.command(name='repo')
     async def cmd_repo(self, ctx, repo_name: str = None, private: str = "true"):
         """Switch to or create a repository"""
-        if not repo_name:
-            current = await get_current_repo(ctx.author.id, self.bot.db)
-            await ctx.send(f"Current repository: `{current}`")
+        if not await self._ensure_github_ready(ctx):
             return
         
-        if not self.bot.github_client:
-            await ctx.send("GitHub client not ready. Please wait for bot initialization.")
+        if not repo_name:
+            current = await self.bot.db.get_user_repo(ctx.author.id)
+            await ctx.send(f"Current repository: `{current}`")
             return
         
         repo_name = sanitize_filename(repo_name)
@@ -442,7 +683,7 @@ class GitHubCommands(commands.Cog):
             repo = self.bot.github_client.get_repo(repo_full_name)
             
             # Success - repository exists
-            await set_current_repo(ctx.author.id, repo_full_name, self.bot.db)
+            await self.bot.db.set_user_repo(ctx.author.id, repo_full_name)
             
             embed = discord.Embed(
                 title="Repository Switched",
@@ -490,7 +731,7 @@ class GitHubCommands(commands.Cog):
                         )
                         
                         repo_full_name = f"{self.bot.github_username}/{repo_name}"
-                        await set_current_repo(ctx.author.id, repo_full_name, self.bot.db)
+                        await self.bot.db.set_user_repo(ctx.author.id, repo_full_name)
                         
                         embed = discord.Embed(
                             title="Repository Created",
@@ -515,9 +756,7 @@ class GitHubCommands(commands.Cog):
     @commands.command(name='create')
     async def cmd_create(self, ctx, filename: str, *, content: str):
         """Create a new file"""
-        current_repo = await get_current_repo(ctx.author.id, self.bot.db)
-        if not current_repo or current_repo == DEFAULT_REPO:
-            await ctx.send("Please select a repository first using `--repo <name>`")
+        if not await self._ensure_github_ready(ctx):
             return
         
         filename = sanitize_filename(filename)
@@ -526,43 +765,13 @@ class GitHubCommands(commands.Cog):
             await ctx.send("File too large (max 10KB)")
             return
         
-        try:
-            # Parse repo owner and name from current_repo
-            if '/' in current_repo:
-                owner, repo_name = current_repo.split('/', 1)
-            else:
-                owner = self.bot.github_username
-                repo_name = current_repo
-            
-            branch = await get_current_branch(ctx.author.id, self.bot.db)
-            commit_message = await get_commit_message(ctx.author.id, self.bot.db)
-            
-            # Use GitHub API
-            status, response = await github_api_request(
-                "PUT",
-                f"/repos/{owner}/{repo_name}/contents/{filename}",
-                {
-                    "message": f"{commit_message}",
-                    "content": encode_content(content),
-                    "branch": branch
-                }
-            )
-            
-            if status == 201:
-                await ctx.send(f"Created `{filename}` in `{current_repo}` (branch: {branch})")
-            else:
-                error = response.get('message', f'Unknown error (status: {status})')
-                await ctx.send(f"Error: {error}")
-                
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
+        success, message = await self.bot.github_handler.create_file(ctx.author.id, filename, content)
+        await ctx.send(message)
     
     @commands.command(name='edit')
     async def cmd_edit(self, ctx, filename: str, *, content: str):
         """Edit an existing file"""
-        current_repo = await get_current_repo(ctx.author.id, self.bot.db)
-        if not current_repo or current_repo == DEFAULT_REPO:
-            await ctx.send("Please select a repository first using `--repo <name>`")
+        if not await self._ensure_github_ready(ctx):
             return
         
         filename = sanitize_filename(filename)
@@ -571,357 +780,192 @@ class GitHubCommands(commands.Cog):
             await ctx.send("File too large (max 10KB)")
             return
         
-        try:
-            # Parse repo owner and name from current_repo
-            if '/' in current_repo:
-                owner, repo_name = current_repo.split('/', 1)
-            else:
-                owner = self.bot.github_username
-                repo_name = current_repo
-            
-            branch = await get_current_branch(ctx.author.id, self.bot.db)
-            commit_message = await get_commit_message(ctx.author.id, self.bot.db)
-            
-            # Get existing file SHA
-            sha = await get_file_sha(owner, repo_name, filename, branch)
-            if not sha:
-                await ctx.send(f"File `{filename}` not found in repository")
-                return
-            
-            # Update file
-            status, response = await github_api_request(
-                "PUT",
-                f"/repos/{owner}/{repo_name}/contents/{filename}",
-                {
-                    "message": f"{commit_message}",
-                    "content": encode_content(content),
-                    "sha": sha,
-                    "branch": branch
-                }
-            )
-            
-            if status == 200:
-                await ctx.send(f"Updated `{filename}` in `{current_repo}` (branch: {branch})")
-            else:
-                error = response.get('message', f'Unknown error (status: {status})')
-                await ctx.send(f"Error: {error}")
-                
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
+        success, message = await self.bot.github_handler.edit_file(ctx.author.id, filename, content)
+        await ctx.send(message)
     
     @commands.command(name='view')
     async def cmd_view(self, ctx, filename: str):
         """View a file"""
-        current_repo = await get_current_repo(ctx.author.id, self.bot.db)
-        if not current_repo or current_repo == DEFAULT_REPO:
-            await ctx.send("Please select a repository first using `--repo <name>`")
+        if not await self._ensure_github_ready(ctx):
             return
         
         filename = sanitize_filename(filename)
         
-        try:
-            # Parse repo owner and name
-            if '/' in current_repo:
-                owner, repo_name = current_repo.split('/', 1)
-            else:
-                owner = self.bot.github_username
-                repo_name = current_repo
+        success, message, content = await self.bot.github_handler.view_file(ctx.author.id, filename)
+        
+        if success and content:
+            # Truncate if too long
+            if len(content) > 1500:
+                content = content[:1500] + "\n... (truncated)"
             
-            branch = await get_current_branch(ctx.author.id, self.bot.db)
+            # Syntax highlighting
+            ext = filename.split('.')[-1].lower() if '.' in filename else 'txt'
+            languages = {
+                'py': 'python', 'js': 'javascript', 'ts': 'typescript',
+                'html': 'html', 'css': 'css', 'json': 'json',
+                'md': 'markdown', 'txt': 'text'
+            }
+            lang = languages.get(ext, 'text')
             
-            # Use GitHub API
-            status, response = await github_api_request(
-                "GET",
-                f"/repos/{owner}/{repo_name}/contents/{filename}?ref={branch}"
+            embed = discord.Embed(
+                title=f"{filename}",
+                description=message,
+                color=discord.Color.blue()
             )
+            embed.add_field(name="Content", value=f"```{lang}\n{content}\n```", inline=False)
             
-            if status == 200:
-                content = decode_content(response['content'])
-                
-                if len(content) > 1500:
-                    content = content[:1500] + "\n... (truncated)"
-                
-                # Syntax highlighting
-                ext = filename.split('.')[-1].lower() if '.' in filename else 'txt'
-                languages = {
-                    'py': 'python', 'js': 'javascript', 'ts': 'typescript',
-                    'html': 'html', 'css': 'css', 'json': 'json',
-                    'md': 'markdown', 'txt': 'text'
-                }
-                lang = languages.get(ext, 'text')
-                
-                embed = discord.Embed(
-                    title=f"{filename}",
-                    description=f"From `{repo_name}` (branch: {branch})",
-                    color=discord.Color.blue()
-                )
-                embed.add_field(name="Content", value=f"```{lang}\n{content}\n```", inline=False)
-                
-                await ctx.send(embed=embed)
-            else:
-                error = response.get('message', 'File not found')
-                await ctx.send(f"Error: {error}")
-                
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
+            await ctx.send(embed=embed)
+        else:
+            await ctx.send(message)
     
     @commands.command(name='list')
     async def cmd_list(self, ctx, path: str = ""):
         """List files in current repository"""
-        current_repo = await get_current_repo(ctx.author.id, self.bot.db)
-        if not current_repo or current_repo == DEFAULT_REPO:
-            await ctx.send("Please select a repository first using `--repo <name>`")
+        if not await self._ensure_github_ready(ctx):
             return
         
-        try:
-            # Parse repo owner and name
-            if '/' in current_repo:
-                owner, repo_name = current_repo.split('/', 1)
-            else:
-                owner = self.bot.github_username
-                repo_name = current_repo
+        success, message, files = await self.bot.github_handler.list_files(ctx.author.id, path)
+        
+        if success:
+            files_list = []
+            directories = []
             
-            branch = await get_current_branch(ctx.author.id, self.bot.db)
+            for item in files:
+                item_type = item.get('type', 'unknown')
+                name = item.get('name', 'unknown')
+                if item_type == 'file':
+                    size = item.get('size', 0)
+                    files_list.append(f"{name} ({size} bytes)")
+                elif item_type == 'dir':
+                    directories.append(f"{name}/")
             
-            # Use GitHub API
-            endpoint = f"/repos/{owner}/{repo_name}/contents/{path}?ref={branch}" if path else f"/repos/{owner}/{repo_name}/contents?ref={branch}"
-            status, response = await github_api_request("GET", endpoint)
+            embed = discord.Embed(
+                title=message,
+                color=discord.Color.purple()
+            )
             
-            if status == 200:
-                files = []
-                directories = []
-                
-                for item in response:
-                    item_type = item.get('type', 'unknown')
-                    name = item.get('name', 'unknown')
-                    if item_type == 'file':
-                        size = item.get('size', 0)
-                        files.append(f"{name} ({size} bytes)")
-                    elif item_type == 'dir':
-                        directories.append(f"{name}/")
-                
-                embed = discord.Embed(
-                    title=f"Contents of {repo_name}" + (f"/{path}" if path else ""),
-                    description=f"Branch: {branch}",
-                    color=discord.Color.purple()
-                )
-                
-                if directories:
-                    embed.add_field(name="Directories", value="\n".join(directories[:20]), inline=False)
-                
-                if files:
-                    embed.add_field(name="Files", value="\n".join(files[:20]), inline=False)
-                
-                if not files and not directories:
-                    embed.description = "This directory is empty"
-                elif len(files) > 20 or len(directories) > 20:
-                    embed.set_footer(text="Showing first 20 items each")
-                
-                await ctx.send(embed=embed)
-            else:
-                error = response.get('message', f'Repository not found (status: {status})')
-                await ctx.send(f"Error: {error}")
-                
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
+            if directories:
+                embed.add_field(name="Directories", value="\n".join(directories[:20]), inline=False)
+            
+            if files_list:
+                embed.add_field(name="Files", value="\n".join(files_list[:20]), inline=False)
+            
+            if not files_list and not directories:
+                embed.description = "This directory is empty"
+            elif len(files_list) > 20 or len(directories) > 20:
+                embed.set_footer(text="Showing first 20 items each")
+            
+            await ctx.send(embed=embed)
+        else:
+            await ctx.send(message)
     
     @commands.command(name='current')
     async def cmd_current(self, ctx):
-        """Show current repository"""
-        current_repo = await get_current_repo(ctx.author.id, self.bot.db)
-        current_branch = await get_current_branch(ctx.author.id, self.bot.db)
-        commit_message = await get_commit_message(ctx.author.id, self.bot.db)
+        """Show current repository settings"""
+        repo = await self.bot.db.get_user_repo(ctx.author.id)
+        branch = await self.bot.db.get_user_branch(ctx.author.id)
+        commit_msg = await self.bot.db.get_user_commit_message(ctx.author.id)
         
         embed = discord.Embed(
             title="Current Settings",
             color=discord.Color.blue()
         )
-        embed.add_field(name="Repository", value=f"`{current_repo}`", inline=False)
-        embed.add_field(name="Branch", value=f"`{current_branch}`", inline=True)
-        embed.add_field(name="Commit Message", value=f"`{commit_message}`", inline=True)
+        embed.add_field(name="Repository", value=f"`{repo}`", inline=False)
+        embed.add_field(name="Branch", value=f"`{branch}`", inline=True)
+        embed.add_field(name="Commit Message", value=f"`{commit_msg}`", inline=True)
         
         await ctx.send(embed=embed)
     
     @commands.command(name='delete')
     async def cmd_delete(self, ctx, filename: str):
         """Delete a file"""
-        current_repo = await get_current_repo(ctx.author.id, self.bot.db)
-        if not current_repo or current_repo == DEFAULT_REPO:
-            await ctx.send("Please select a repository first using `--repo <name>`")
+        if not await self._ensure_github_ready(ctx):
             return
         
         filename = sanitize_filename(filename)
         
-        try:
-            # Parse repo owner and name
-            if '/' in current_repo:
-                owner, repo_name = current_repo.split('/', 1)
-            else:
-                owner = self.bot.github_username
-                repo_name = current_repo
-            
-            branch = await get_current_branch(ctx.author.id, self.bot.db)
-            commit_message = await get_commit_message(ctx.author.id, self.bot.db)
-            
-            # Get existing file SHA
-            sha = await get_file_sha(owner, repo_name, filename, branch)
-            if not sha:
-                await ctx.send(f"File `{filename}` not found in repository")
-                return
-            
-            # Delete file
-            status, response = await github_api_request(
-                "DELETE",
-                f"/repos/{owner}/{repo_name}/contents/{filename}",
-                {
-                    "message": f"{commit_message}",
-                    "sha": sha,
-                    "branch": branch
-                }
-            )
-            
-            if status == 200:
-                await ctx.send(f"Deleted `{filename}` from `{current_repo}` (branch: {branch})")
-            else:
-                error = response.get('message', f'Unknown error (status: {status})')
-                await ctx.send(f"Error: {error}")
-                
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
+        success, message = await self.bot.github_handler.delete_file(ctx.author.id, filename)
+        await ctx.send(message)
     
     @commands.command(name='branch')
     async def cmd_branch(self, ctx, branch_name: str = None):
         """Switch branch or list branches"""
-        current_repo = await get_current_repo(ctx.author.id, self.bot.db)
-        if not current_repo or current_repo == DEFAULT_REPO:
-            await ctx.send("Please select a repository first using `--repo <name>`")
+        if not await self._ensure_github_ready(ctx):
             return
         
-        try:
-            # Parse repo owner and name
-            if '/' in current_repo:
-                owner, repo_name = current_repo.split('/', 1)
-            else:
-                owner = self.bot.github_username
-                repo_name = current_repo
+        if not branch_name:
+            # List branches
+            success, message, branches = await self.bot.github_handler.get_branches(ctx.author.id)
             
-            if not branch_name:
-                # List branches
-                status, response = await github_api_request(
-                    "GET",
-                    f"/repos/{owner}/{repo_name}/branches"
+            if success:
+                current_branch = await self.bot.db.get_user_branch(ctx.author.id)
+                
+                embed = discord.Embed(
+                    title=message,
+                    color=discord.Color.purple()
                 )
                 
-                if status == 200:
-                    branches = [branch['name'] for branch in response]
-                    current_branch = await get_current_branch(ctx.author.id, self.bot.db)
-                    
-                    embed = discord.Embed(
-                        title=f"Branches in {repo_name}",
-                        color=discord.Color.purple()
-                    )
-                    
-                    branch_list = []
-                    for branch in branches[:20]:
-                        if branch == current_branch:
-                            branch_list.append(f"**{branch}** (current)")
-                        else:
-                            branch_list.append(branch)
-                    
-                    embed.description = "\n".join(branch_list)
-                    
-                    if len(branches) > 20:
-                        embed.set_footer(text=f"Showing first 20 of {len(branches)} branches")
-                    
-                    await ctx.send(embed=embed)
-                else:
-                    error = response.get('message', f'Unknown error (status: {status})')
-                    await ctx.send(f"Error: {error}")
+                branch_list = []
+                for branch in branches[:20]:
+                    if branch == current_branch:
+                        branch_list.append(f"**{branch}** (current)")
+                    else:
+                        branch_list.append(branch)
+                
+                embed.description = "\n".join(branch_list)
+                
+                if len(branches) > 20:
+                    embed.set_footer(text=f"Showing first 20 of {len(branches)} branches")
+                
+                await ctx.send(embed=embed)
             else:
-                # Switch branch
-                # First check if branch exists
-                status, response = await github_api_request(
-                    "GET",
-                    f"/repos/{owner}/{repo_name}/branches/{branch_name}"
+                await ctx.send(message)
+        else:
+            # Switch branch
+            success, message, branches = await self.bot.github_handler.get_branches(ctx.author.id)
+            
+            if success and branch_name in branches:
+                await self.bot.db.set_user_branch(ctx.author.id, branch_name)
+                await ctx.send(f"Switched to branch: `{branch_name}`")
+            else:
+                # Branch doesn't exist, ask to create
+                embed = discord.Embed(
+                    title="Branch Not Found",
+                    description=f"Branch `{branch_name}` doesn't exist.",
+                    color=discord.Color.orange()
+                )
+                embed.add_field(
+                    name="Create it?",
+                    value="Type `create` to create this branch or `cancel` to abort.",
+                    inline=False
                 )
                 
-                if status == 200:
-                    await set_current_branch(ctx.author.id, branch_name, self.bot.db)
-                    await ctx.send(f"Switched to branch: `{branch_name}`")
-                else:
-                    # Branch doesn't exist, ask to create
-                    embed = discord.Embed(
-                        title="Branch Not Found",
-                        description=f"Branch `{branch_name}` doesn't exist in `{repo_name}`.",
-                        color=discord.Color.orange()
-                    )
-                    embed.add_field(
-                        name="Create it?",
-                        value="Type `create` to create this branch or `cancel` to abort.",
-                        inline=False
-                    )
-                    
-                    await ctx.send(embed=embed)
-                    
-                    def check(m):
-                        return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ['create', 'cancel']
-                    
-                    try:
-                        msg = await self.bot.wait_for('message', timeout=30.0, check=check)
-                        
-                        if msg.content.lower() == 'create':
-                            # Get default branch SHA
-                            default_branch_status, default_branch_response = await github_api_request(
-                                "GET",
-                                f"/repos/{owner}/{repo_name}/git/refs/heads/main"
-                            )
-                            
-                            if default_branch_status != 200:
-                                # Try master instead
-                                default_branch_status, default_branch_response = await github_api_request(
-                                    "GET",
-                                    f"/repos/{owner}/{repo_name}/git/refs/heads/master"
-                                )
-                            
-                            if default_branch_status == 200:
-                                sha = default_branch_response['object']['sha']
-                                
-                                # Create new branch
-                                create_status, create_response = await github_api_request(
-                                    "POST",
-                                    f"/repos/{owner}/{repo_name}/git/refs",
-                                    {
-                                        "ref": f"refs/heads/{branch_name}",
-                                        "sha": sha
-                                    }
-                                )
-                                
-                                if create_status == 201:
-                                    await set_current_branch(ctx.author.id, branch_name, self.bot.db)
-                                    await ctx.send(f"Created and switched to branch: `{branch_name}`")
-                                else:
-                                    error = create_response.get('message', 'Failed to create branch')
-                                    await ctx.send(f"Error: {error}")
-                            else:
-                                await ctx.send("Could not find default branch to create from")
-                        else:
-                            await ctx.send("Branch creation cancelled.")
-                            
-                    except asyncio.TimeoutError:
-                        await ctx.send("Branch creation timed out.")
+                await ctx.send(embed=embed)
                 
-        except Exception as e:
-            await ctx.send(f"Error: {str(e)}")
+                def check(m):
+                    return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ['create', 'cancel']
+                
+                try:
+                    msg = await self.bot.wait_for('message', timeout=30.0, check=check)
+                    
+                    if msg.content.lower() == 'create':
+                        success, message = await self.bot.github_handler.create_branch(ctx.author.id, branch_name)
+                        await ctx.send(message)
+                    else:
+                        await ctx.send("Branch creation cancelled.")
+                        
+                except asyncio.TimeoutError:
+                    await ctx.send("Branch creation timed out.")
     
     @commands.command(name='commit')
     async def cmd_commit(self, ctx, *, message: str = None):
         """Set commit message"""
         if not message:
-            current_message = await get_commit_message(ctx.author.id, self.bot.db)
+            current_message = await self.bot.db.get_user_commit_message(ctx.author.id)
             await ctx.send(f"Current commit message: `{current_message}`")
             return
         
-        await set_commit_message(ctx.author.id, message, self.bot.db)
+        await self.bot.db.set_user_commit_message(ctx.author.id, message)
         await ctx.send(f"Commit message set to: `{message}`")
     
     @commands.command(name='prefix')
@@ -943,7 +987,7 @@ class GitHubCommands(commands.Cog):
             await ctx.send("Prefix cannot contain spaces")
             return
         
-        await update_user_settings(ctx.author.id, self.bot.db, preferred_prefix=new_prefix)
+        await self.bot.db.set_user_prefix(ctx.author.id, new_prefix)
         await ctx.send(f"Command prefix changed to: `{new_prefix}`")
     
     @commands.command(name='help')
