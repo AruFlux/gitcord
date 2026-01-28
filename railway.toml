@@ -1,0 +1,12 @@
+[build]
+builder = "nixpacks"
+builderVersion = "latest"
+
+[deploy]
+startCommand = "python bot.py"
+
+[build.environment]
+PYTHON_VERSION = "3.11"
+
+[build.scripts]
+build = "pip install -r requirements.txt"
