@@ -24,11 +24,6 @@ discord.voice_client.VoiceClient = None
 load_dotenv()
 
 # Configuration
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
-DEFAULT_REPO = os.getenv("DEFAULT_REPO", "discord-projects")
-DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Validate required environment variables
 if not DISCORD_TOKEN:
